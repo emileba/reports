@@ -1,0 +1,5 @@
+*.json
+!package.json
+.env
+*.token
+*.key
