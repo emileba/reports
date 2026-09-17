@@ -1,0 +1,129 @@
+name: cleanup-old-reports
+
+# Deletes PDFs under r/ whose LAST COMMIT is older than MAX_AGE_DAYS.
+#
+# DRY RUN IS THE DEFAULT, EVERYWHERE.
+#   - Scheduled runs are dry-run unless the repository variable
+#     CLEANUP_DELETE is set to the string "true"
+#     (Settings > Secrets and variables > Actions > Variables).
+#   - Manual runs are dry-run unless you tick the "delete" box.
+# A dry run changes nothing and writes the full list to the run summary.
+
+on:
+  schedule:
+    # Sundays, 04:17 UTC. Off-the-hour to avoid GitHub's scheduler congestion.
+    - cron: '17 4 * * 0'
+  workflow_dispatch:
+    inputs:
+      delete:
+        description: 'Actually delete (unticked = dry run)'
+        type: boolean
+        default: false
+      max_age_days:
+        description: 'Delete files whose last commit is older than this many days'
+        type: string
+        default: '30'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cleanup-old-reports
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@v4
+        with:
+          # Full history: we need `git log` per file to find its last commit date.
+          fetch-depth: 0
+
+      - name: Select and remove expired reports
+        env:
+          # Empty string on a scheduled run; "true"/"false" on workflow_dispatch.
+          DELETE_INPUT: ${{ inputs.delete }}
+          DELETE_VAR: ${{ vars.CLEANUP_DELETE }}
+          MAX_AGE_DAYS: ${{ inputs.max_age_days || '30' }}
+        run: |
+          set -euo pipefail
+
+          if [ "$DELETE_INPUT" = "true" ]; then
+            DELETE=1; MODE="LIVE (manual)"
+          elif [ -z "$DELETE_INPUT" ] && [ "$DELETE_VAR" = "true" ]; then
+            DELETE=1; MODE="LIVE (scheduled, CLEANUP_DELETE=true)"
+          else
+            DELETE=0; MODE="DRY RUN"
+          fi
+
+          case "$MAX_AGE_DAYS" in
+            ''|*[!0-9]*) echo "::error::max_age_days must be a positive integer, got '$MAX_AGE_DAYS'"; exit 1 ;;
+          esac
+
+          CUTOFF=$(date -u -d "$MAX_AGE_DAYS days ago" +%s)
+          echo "Mode: $MODE"
+          echo "Cutoff: $(date -u -d "@$CUTOFF" '+%Y-%m-%d %H:%M:%S UTC') (older than $MAX_AGE_DAYS days)"
+
+          EXPIRED=$(mktemp)
+          KEPT=0
+
+          # -print0 / read -d '' so odd filenames cannot break the loop.
+          while IFS= read -r -d '' f; do
+            ts=$(git log -1 --format=%ct -- "$f" || true)
+            if [ -z "$ts" ]; then
+              echo "  ?  no commit found, skipping: $f"
+              continue
+            fi
+            if [ "$ts" -lt "$CUTOFF" ]; then
+              age=$(( ( $(date -u +%s) - ts ) / 86400 ))
+              printf '%s\t%s\t%s\n' "$f" "$(date -u -d "@$ts" '+%Y-%m-%d')" "${age}d" >> "$EXPIRED"
+            else
+              KEPT=$((KEPT + 1))
+            fi
+          done < <(find r -type f ! -name '.gitkeep' -print0 | sort -z)
+
+          COUNT=$(wc -l < "$EXPIRED" | tr -d ' ')
+
+          {
+            echo "### cleanup-old-reports"
+            echo
+            echo "- **Mode:** $MODE"
+            echo "- **Threshold:** older than $MAX_AGE_DAYS days"
+            echo "- **Expired:** $COUNT"
+            echo "- **Kept:** $KEPT"
+            echo
+            if [ "$COUNT" -gt 0 ]; then
+              echo "| File | Last commit | Age |"
+              echo "|---|---|---|"
+              while IFS=$'\t' read -r f d a; do
+                echo "| \`$f\` | $d | $a |"
+              done < "$EXPIRED"
+            else
+              echo "_Nothing to remove._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "Nothing expired. Kept $KEPT file(s)."
+            exit 0
+          fi
+
+          echo "Expired ($COUNT):"
+          cut -f1 "$EXPIRED" | sed 's/^/  - /'
+
+          if [ "$DELETE" -eq 0 ]; then
+            echo
+            echo "DRY RUN: nothing was deleted."
+            echo "Re-run from the Actions tab with 'delete' ticked to remove these."
+            exit 0
+          fi
+
+          cut -f1 "$EXPIRED" | tr '\n' '\0' | xargs -0 git rm --quiet --
+
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "cleanup: remove $COUNT report(s) older than $MAX_AGE_DAYS days"
+          git push
+          echo "Deleted $COUNT file(s)."
